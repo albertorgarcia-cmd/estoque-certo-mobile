@@ -148,13 +148,21 @@
     openModal('Restaurar backup',`<div class="notice warning">A restauração substitui produtos e todos os inventários. <strong>Baixe seu backup atual antes de continuar.</strong></div>${btn('Baixar backup atual','backup','','download')}<label class="file-zone">Backup JSON do Estoque Certo Mobile<input id="restore-file" type="file" accept=".json,application/json"></label><div id="restore-preview" aria-live="polite"></div>`);
   }
   async function readFile(input,max=10*1024*1024) { const file=input.files[0];if(!file)return null;if(file.size>max)throw new Error('Arquivo grande demais. Limite: '+Math.round(max/1024/1024)+' MB.');const content=await file.text();if(content.includes('\uFFFD'))throw new Error('Codificação inválida. Salve o arquivo como UTF-8 e tente novamente.');return content; }
-  let zxingReader=null;
+  // O ZXing faz a leitura no iPhone; a sessão impede callbacks de câmeras já fechadas.
+  let zxingReader=null, scanSession=0;
   function stopCamera() {
+    scanSession++;
     clearTimeout(scanTimer);
-    if(zxingReader){try{zxingReader.reset();}catch(e){} zxingReader=null;}
+    scanTimer=null;
+    const active=zxingReader;
+    zxingReader=null;
+    if(active){try{active.stop();}catch(e){}}
     cameraStream?.getTracks().forEach(t=>t.stop());cameraStream=null;
+    const video=$('#scan-video');
+    if(video?.srcObject){try{video.srcObject.getTracks().forEach(t=>t.stop());}catch(e){}video.srcObject=null;}
   }
   function acceptScannedCode(code,inv) {
+    code=String(code??'').trim();
     const product=inv.items.find(p=>p.codigo===code);
     if(product){selectedCode=code;query=code;status='';category='';page=1;closeModal();render();$('#count-value')?.focus();return true;}
     if($('#scan-message'))$('#scan-message').textContent='Código '+code+' não cadastrado neste inventário. Tente outro produto.';
@@ -178,38 +186,36 @@
     if(!window.isSecureContext||!navigator.mediaDevices?.getUserMedia){
       openModal('Leitura pela câmera',`<div class="notice">A câmera exige HTTPS e permissão do usuário. Use a pesquisa por código ou descrição.</div><div class="form-actions">${btn('Entendi','cancel','primary')}</div>`);return;
     }
-    openModal('Ler código de barras',`<p class="help-text">Aponte para o código do produto. Nenhuma imagem é enviada para nosso servidor.</p><video id="scan-video" class="scan-video" autoplay muted playsinline></video><p id="scan-message" class="help-text" role="status">Preparando a câmera...</p><div class="form-actions">${btn('Fechar câmera','cancel')}</div>`);
+    openModal('Ler código de barras',`<p class="help-text">Aponte para o código do produto. Nenhuma imagem é enviada para nosso servidor.</p><video id="scan-video" class="scan-video" autoplay muted playsinline></video><p id="scan-message" class="help-text" role="status">Carregando leitor de código de barras...</p><div class="form-actions">${btn('Fechar câmera','cancel')}</div>`);
+    const session=scanSession;
     try {
-      if('BarcodeDetector' in window){
-        const formats=await BarcodeDetector.getSupportedFormats();
-        const supported=['ean_13','ean_8','code_128','code_39','upc_a','upc_e','itf'].filter(f=>formats.includes(f));
-        if(supported.length){
-          const detector=new BarcodeDetector({formats:supported});
-          const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}},audio:false});
-          if(!modal.open||!$('#scan-video')){stream.getTracks().forEach(t=>t.stop());return;}
-          cameraStream=stream;const video=$('#scan-video');video.srcObject=stream;await video.play();
-          $('#scan-message').textContent='Posicione o código de barras no centro da imagem.';
-          async function tick(){if(!cameraStream||!modal.open)return;
-            try{const results=await detector.detect(video);if(!cameraStream||!modal.open)return;
-              if(results.length&&acceptScannedCode(results[0].rawValue,inv))return;
-            }catch(e){}
-            if(cameraStream&&modal.open)scanTimer=setTimeout(tick,350);
-          }
-          tick();return;
-        }
-      }
-      $('#scan-message').textContent='Carregando leitor compatível com iPhone...';
+      // Usar o mesmo decodificador em todos os navegadores evita que um detector
+      // nativo abra a câmera mas falhe silenciosamente na leitura.
       const ZX=await loadZXing();
-      if(!modal.open||!$('#scan-video'))return;
-      const reader=new ZX.BrowserMultiFormatReader();zxingReader=reader;
-      $('#scan-message').textContent='Permita a câmera e aponte para o código de barras.';
-      const controls=await reader.decodeFromConstraints({video:{facingMode:{ideal:'environment'}},audio:false},$('#scan-video'),(result,error)=>{
-        if(result&&modal.open&&zxingReader===reader)acceptScannedCode(result.getText(),inv);
-      });
-      if(!modal.open||zxingReader!==reader){controls.stop();return;}
-      // ZXing Browser usa controls.stop(), não reset() nas versões recentes.
-      zxingReader={reset:()=>controls.stop()};
-    }catch(e){stopCamera();if($('#scan-message'))$('#scan-message').textContent='Câmera indisponível: '+e.message+' Use a pesquisa manual.';}
+      if(session!==scanSession||!modal.open||!$('#scan-video'))return;
+      const reader=new ZX.BrowserMultiFormatReader();
+      const video=$('#scan-video');
+      $('#scan-message').textContent='Solicitando câmera traseira...';
+      const controls=await reader.decodeFromConstraints(
+        {video:{facingMode:{ideal:'environment'}},audio:false},video,
+        (result,error)=>{
+          if(session!==scanSession||!modal.open)return;
+          if(result){acceptScannedCode(result.getText(),inv);return;}
+          // NotFoundException é normal enquanto o código não está enquadrado.
+          if(error&&error.name&&!['NotFoundException','ChecksumException','FormatException'].includes(error.name)){
+            const message=$('#scan-message');
+            if(message)message.textContent='Leitor ativo. Aproxime o código, melhore a iluminação e mantenha a imagem nítida.';
+          }
+        }
+      );
+      if(session!==scanSession||!modal.open){controls.stop();return;}
+      zxingReader=controls;
+      $('#scan-message').textContent='Leitor ativo. Centralize o código de barras e mantenha a imagem nítida.';
+    }catch(e){
+      if(session!==scanSession)return;
+      stopCamera();
+      if($('#scan-message'))$('#scan-message').textContent='Não foi possível iniciar o leitor: '+(e?.message||'erro desconhecido')+'. Use a pesquisa manual.';
+    }
   }
   async function updatePWAState() {
     if(!$('#pwa-state')||location.protocol==='file:')return;
