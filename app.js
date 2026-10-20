@@ -148,30 +148,67 @@
     openModal('Restaurar backup',`<div class="notice warning">A restauração substitui produtos e todos os inventários. <strong>Baixe seu backup atual antes de continuar.</strong></div>${btn('Baixar backup atual','backup','','download')}<label class="file-zone">Backup JSON do Estoque Certo Mobile<input id="restore-file" type="file" accept=".json,application/json"></label><div id="restore-preview" aria-live="polite"></div>`);
   }
   async function readFile(input,max=10*1024*1024) { const file=input.files[0];if(!file)return null;if(file.size>max)throw new Error('Arquivo grande demais. Limite: '+Math.round(max/1024/1024)+' MB.');const content=await file.text();if(content.includes('\uFFFD'))throw new Error('Codificação inválida. Salve o arquivo como UTF-8 e tente novamente.');return content; }
-  function stopCamera() { clearTimeout(scanTimer);cameraStream?.getTracks().forEach(t=>t.stop());cameraStream=null; }
+  let zxingReader=null;
+  function stopCamera() {
+    clearTimeout(scanTimer);
+    if(zxingReader){try{zxingReader.reset();}catch(e){} zxingReader=null;}
+    cameraStream?.getTracks().forEach(t=>t.stop());cameraStream=null;
+  }
+  function acceptScannedCode(code,inv) {
+    const product=inv.items.find(p=>p.codigo===code);
+    if(product){selectedCode=code;query=code;status='';category='';page=1;closeModal();render();$('#count-value')?.focus();return true;}
+    if($('#scan-message'))$('#scan-message').textContent='Código '+code+' não cadastrado neste inventário. Tente outro produto.';
+    return false;
+  }
+  function loadZXing() {
+    if(window.ZXingBrowser)return Promise.resolve(window.ZXingBrowser);
+    if(window.__estoqueZXingPromise)return window.__estoqueZXingPromise;
+    // Biblioteca de terceiros carregada sob demanda; requer internet na primeira utilização.
+    window.__estoqueZXingPromise=new Promise((resolve,reject)=>{
+      const script=document.createElement('script');
+      script.src='https://cdn.jsdelivr.net/npm/@zxing/browser@0.1.5/umd/zxing-browser.min.js';
+      script.onload=()=>window.ZXingBrowser?resolve(window.ZXingBrowser):reject(new Error('Biblioteca não carregada.'));
+      script.onerror=()=>reject(new Error('Não foi possível carregar o leitor. Verifique a internet.'));
+      document.head.appendChild(script);
+    }).catch(e=>{window.__estoqueZXingPromise=null;throw e;});
+    return window.__estoqueZXingPromise;
+  }
   async function scan() {
     const inv=inventory();if(!inv||inv.closedAt){toast('Selecione um inventário em andamento.');return;}
-    if(!window.isSecureContext||!navigator.mediaDevices?.getUserMedia||!('BarcodeDetector' in window)) {
-      openModal('Leitura pela câmera',`<div class="notice">A leitura pela câmera não está disponível neste navegador ou endereço. Use a pesquisa por código ou descrição. Um leitor USB/Bluetooth que funciona como teclado também pode preencher a pesquisa.</div><p class="help-text">Câmera exige HTTPS ou localhost, permissão do usuário e suporte à BarcodeDetector. No iPhone, prefira a busca manual.</p><div class="form-actions">${btn('Entendi','cancel','primary')}</div>`);return;
+    if(!window.isSecureContext||!navigator.mediaDevices?.getUserMedia){
+      openModal('Leitura pela câmera',`<div class="notice">A câmera exige HTTPS e permissão do usuário. Use a pesquisa por código ou descrição.</div><div class="form-actions">${btn('Entendi','cancel','primary')}</div>`);return;
     }
-    openModal('Ler código de barras',`<p class="help-text">Aponte para o código do produto. Nenhuma imagem é enviada.</p><video id="scan-video" class="scan-video" autoplay muted playsinline></video><p id="scan-message" class="help-text" role="status">Solicitando acesso à câmera...</p><div class="form-actions">${btn('Fechar câmera','cancel')}</div>`);
+    openModal('Ler código de barras',`<p class="help-text">Aponte para o código do produto. Nenhuma imagem é enviada para nosso servidor.</p><video id="scan-video" class="scan-video" autoplay muted playsinline></video><p id="scan-message" class="help-text" role="status">Preparando a câmera...</p><div class="form-actions">${btn('Fechar câmera','cancel')}</div>`);
     try {
-      const formats=await BarcodeDetector.getSupportedFormats();
-      const supported=['ean_13','ean_8','code_128','code_39','upc_a','upc_e','itf'].filter(f=>formats.includes(f));
-      if(!supported.length)throw new Error('Este navegador não oferece um formato de código de barras compatível.');
-      const detector=new BarcodeDetector({formats:supported});
-      const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}},audio:false});
-      if(!modal.open||!$('#scan-video')){stream.getTracks().forEach(t=>t.stop());return;}
-      cameraStream=stream;const video=$('#scan-video');video.srcObject=stream;await video.play();
-      $('#scan-message').textContent='Posicione o código de barras no centro da imagem.';
-      async function tick(){
-        if(!cameraStream||!modal.open)return;
-        try {const results=await detector.detect(video);if(!cameraStream||!modal.open)return;
-          if(results.length){const code=results[0].rawValue;const product=inv.items.find(p=>p.codigo===code);if(product){selectedCode=code;query=code;status='';category='';page=1;closeModal();render();$('#count-value')?.focus();return;}$('#scan-message').textContent='Código '+code+' ausente deste inventário. Tente outro produto.';}
-        }catch(e){if($('#scan-message'))$('#scan-message').textContent='Não foi possível ler esta imagem. Tente reposicionar.';}
-        if(cameraStream&&modal.open)scanTimer=setTimeout(tick,350);
+      if('BarcodeDetector' in window){
+        const formats=await BarcodeDetector.getSupportedFormats();
+        const supported=['ean_13','ean_8','code_128','code_39','upc_a','upc_e','itf'].filter(f=>formats.includes(f));
+        if(supported.length){
+          const detector=new BarcodeDetector({formats:supported});
+          const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}},audio:false});
+          if(!modal.open||!$('#scan-video')){stream.getTracks().forEach(t=>t.stop());return;}
+          cameraStream=stream;const video=$('#scan-video');video.srcObject=stream;await video.play();
+          $('#scan-message').textContent='Posicione o código de barras no centro da imagem.';
+          async function tick(){if(!cameraStream||!modal.open)return;
+            try{const results=await detector.detect(video);if(!cameraStream||!modal.open)return;
+              if(results.length&&acceptScannedCode(results[0].rawValue,inv))return;
+            }catch(e){}
+            if(cameraStream&&modal.open)scanTimer=setTimeout(tick,350);
+          }
+          tick();return;
+        }
       }
-      tick();
+      $('#scan-message').textContent='Carregando leitor compatível com iPhone...';
+      const ZX=await loadZXing();
+      if(!modal.open||!$('#scan-video'))return;
+      const reader=new ZX.BrowserMultiFormatReader();zxingReader=reader;
+      $('#scan-message').textContent='Permita a câmera e aponte para o código de barras.';
+      const controls=await reader.decodeFromConstraints({video:{facingMode:{ideal:'environment'}},audio:false},$('#scan-video'),(result,error)=>{
+        if(result&&modal.open&&zxingReader===reader)acceptScannedCode(result.getText(),inv);
+      });
+      if(!modal.open||zxingReader!==reader){controls.stop();return;}
+      // ZXing Browser usa controls.stop(), não reset() nas versões recentes.
+      zxingReader={reset:()=>controls.stop()};
     }catch(e){stopCamera();if($('#scan-message'))$('#scan-message').textContent='Câmera indisponível: '+e.message+' Use a pesquisa manual.';}
   }
   async function updatePWAState() {
