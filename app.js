@@ -181,6 +181,46 @@
     }).catch(e=>{window.__estoqueZXingPromise=null;throw e;});
     return window.__estoqueZXingPromise;
   }
+  // No Android/Chrome, tenta também o detector nativo sobre o MESMO vídeo.
+  // ZXing continua ativo como alternativa, inclusive para iPhone.
+  async function startNativeScan(video, inv, session) {
+    if (!('BarcodeDetector' in window)) return false;
+    let detector;
+    try {
+      const preferred=['ean_13','ean_8','upc_a','upc_e','code_128','code_39','itf'];
+      const supported=typeof BarcodeDetector.getSupportedFormats==='function'
+        ? await BarcodeDetector.getSupportedFormats() : preferred;
+      const formats=preferred.filter(f=>supported.includes(f));
+      if (!formats.length || session!==scanSession) return false;
+      detector=new BarcodeDetector({formats});
+    } catch(e) { return false; }
+    let attempts=0;
+    const tick=async()=>{
+      if(session!==scanSession||!modal.open||!$('#scan-video'))return;
+      if(video.readyState>=2 && video.videoWidth>0){
+        try {
+          const found=await detector.detect(video);
+          if(session!==scanSession||!modal.open)return;
+          for(const item of found){
+            const code=String(item.rawValue||'').trim();
+            if(code && acceptScannedCode(code,inv))return;
+            if(code){ // Código identificado, mas não cadastrado: manter aviso visível.
+              scanTimer=setTimeout(tick,750);return;
+            }
+          }
+        }catch(e){ /* ZXing permanece como alternativa. */ }
+        attempts++;
+        if(attempts%12===0){
+          const msg=$('#scan-message');
+          if(msg && !msg.textContent.includes('não cadastrado'))
+            msg.textContent='Câmera ativa · procurando código de barras ('+attempts+' verificações). Centralize o código e mantenha a imagem nítida.';
+        }
+      }
+      scanTimer=setTimeout(tick,350);
+    };
+    scanTimer=setTimeout(tick,350);
+    return true;
+  }
   async function scan() {
     const inv=inventory();if(!inv||inv.closedAt){toast('Selecione um inventário em andamento.');return;}
     if(!window.isSecureContext||!navigator.mediaDevices?.getUserMedia){
@@ -204,13 +244,15 @@
           // NotFoundException é normal enquanto o código não está enquadrado.
           if(error&&error.name&&!['NotFoundException','ChecksumException','FormatException'].includes(error.name)){
             const message=$('#scan-message');
-            if(message)message.textContent='Leitor ativo. Aproxime o código, melhore a iluminação e mantenha a imagem nítida.';
+            if(message && !message.textContent.includes('não cadastrado'))message.textContent='Leitor ativo · ZXing: '+String(error.name).slice(0,60)+'. Tentando reconhecer o código...';
           }
         }
       );
       if(session!==scanSession||!modal.open){controls.stop();return;}
       zxingReader=controls;
       $('#scan-message').textContent='Leitor ativo. Centralize o código de barras e mantenha a imagem nítida.';
+      // Não inicia outra câmera: ambos os leitores observam o mesmo vídeo.
+      startNativeScan(video,inv,session).catch(()=>{});
     }catch(e){
       if(session!==scanSession)return;
       stopCamera();
